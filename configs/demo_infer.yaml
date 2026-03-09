@@ -1,0 +1,5 @@
+checkpoint_path: checkpoints/best
+resolution: [512, 384]
+num_inference_steps: 30
+guidance_scale: 2.0
+fixed_seed: 42

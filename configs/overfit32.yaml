@@ -1,0 +1,11 @@
+experiment_name: overfit32
+category: upper_body
+resolution: [512, 384]
+subset_size: 32
+train_batch_size: 1
+gradient_accumulation_steps: 4
+learning_rate: 1.0e-4
+max_train_steps: 3000
+validation_steps: 250
+save_steps: 250
+fixed_seed: 42

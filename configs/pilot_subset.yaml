@@ -1,0 +1,11 @@
+experiment_name: pilot_subset
+category: upper_body
+resolution: [512, 384]
+subset_size: 5000
+train_batch_size: 1
+gradient_accumulation_steps: 8
+learning_rate: 5.0e-5
+max_train_steps: 10000
+validation_steps: 500
+save_steps: 500
+fixed_seed: 42

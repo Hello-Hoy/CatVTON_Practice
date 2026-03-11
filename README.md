@@ -48,7 +48,8 @@ pip install -r requirements.txt
 ```bash
 python3 prepare_masks.py \
   --data_root_path data/DressCode \
-  --categories upper_body,lower_body,dresses
+  --categories upper_body,lower_body,dresses \
+  --num_workers 4
 ```
 
 ### 2. warm-start baseline preview
@@ -75,12 +76,13 @@ python3 train.py \
   --resume_attn_ckpt zhengchong/CatVTON \
   --resume_attn_version dresscode-16k-512 \
   --train_batch_size 1 \
-  --validation_batch_size 2 \
+  --validation_batch_size 1 \
   --gradient_accumulation_steps 1 \
   --num_workers 0 \
   --num_train_steps 100 \
   --checkpointing_steps 50 \
   --validation_steps 50 \
+  --validation_num_inference_steps 10 \
   --run_validation_at_start \
   --max_train_pairs_per_category 64 \
   --max_val_pairs_per_category 4
@@ -118,7 +120,8 @@ python3 preview_infer.py \
 ```bash
 python3 prepare_masks.py \
   --data_root_path data/DressCode \
-  --categories upper_body,lower_body,dresses
+  --categories upper_body,lower_body,dresses \
+  --num_workers 16
 ```
 
 ```bash

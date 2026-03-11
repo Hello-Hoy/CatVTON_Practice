@@ -1,0 +1,10 @@
+accelerate
+diffusers
+huggingface_hub
+numpy
+Pillow
+safetensors
+torch
+torchvision
+tqdm
+transformers

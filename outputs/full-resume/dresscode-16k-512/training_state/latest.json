@@ -1,0 +1,8 @@
+{
+  "latest_checkpoint": "step-016000",
+  "global_step": 16000,
+  "gradient_accumulation_steps": 8,
+  "train_batch_size": 2,
+  "steps_per_epoch": 24196,
+  "dataset_tag": "dresscode-16k-512"
+}

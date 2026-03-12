@@ -1,6 +1,7 @@
 data/
 outputs/
 logs/
+.venv/
 **/agnostic_masks/
 __pycache__/
 *.pyc

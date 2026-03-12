@@ -59,6 +59,15 @@ def resolve_weight_dtype(device: torch.device, mixed_precision: str) -> torch.dt
     return {"no": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[mixed_precision]
 
 
+def resolve_model_path(model_path: str, allow_patterns: Optional[List[str]] = None) -> str:
+    path = Path(model_path)
+    if path.exists():
+        return str(path)
+
+    local_path = snapshot_download(repo_id=model_path, allow_patterns=allow_patterns)
+    return str(local_path)
+
+
 def resize_and_crop(image: Image.Image, size):
     w, h = image.size
     target_w, target_h = size
@@ -100,7 +109,7 @@ def mask_to_tensor(mask: Image.Image) -> torch.Tensor:
 
 
 def tensor_to_pil(tensor: torch.Tensor) -> Image.Image:
-    tensor = tensor.detach().cpu().clamp(0, 1)
+    tensor = tensor.detach().float().cpu().clamp(0, 1)
     array = (tensor.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
     return Image.fromarray(array)
 
@@ -182,20 +191,25 @@ def load_attention_checkpoint(trainable_modules: torch.nn.Module, attn_ckpt: str
 
 
 def resolve_base_model_path(base_model_path: str) -> str:
-    path = Path(base_model_path)
-    if path.exists():
-        return str(path)
-
-    local_path = snapshot_download(
-        repo_id=base_model_path,
+    return resolve_model_path(
+        model_path=base_model_path,
         allow_patterns=[
             "model_index.json",
             "scheduler/*",
-            "vae/*",
             "unet/*",
         ],
     )
-    return str(local_path)
+
+
+def resolve_vae_model_path(vae_model_path: str) -> str:
+    return resolve_model_path(
+        model_path=vae_model_path,
+        allow_patterns=[
+            "config.json",
+            "diffusion_pytorch_model.bin",
+            "diffusion_pytorch_model.safetensors",
+        ],
+    )
 
 
 def save_attention_checkpoint(trainable_modules: torch.nn.Module, output_dir: Path):
@@ -212,14 +226,20 @@ def save_attention_checkpoint(trainable_modules: torch.nn.Module, output_dir: Pa
 
 def build_models(
     base_model_path: str,
+    vae_model_path: str,
     device: torch.device,
     weight_dtype: torch.dtype,
     resume_attn_ckpt: Optional[str] = None,
     resume_attn_version: Optional[str] = None,
 ):
     resolved_base_model_path = resolve_base_model_path(base_model_path)
-    vae = AutoencoderKL.from_pretrained(resolved_base_model_path, subfolder="vae").to(device, dtype=weight_dtype)
-    unet = UNet2DConditionModel.from_pretrained(resolved_base_model_path, subfolder="unet")
+    resolved_vae_model_path = resolve_vae_model_path(vae_model_path)
+    vae = AutoencoderKL.from_pretrained(resolved_vae_model_path).to(device, dtype=weight_dtype)
+    unet = UNet2DConditionModel.from_pretrained(
+        resolved_base_model_path,
+        subfolder="unet",
+        use_safetensors=False,
+    )
     init_adapter(unet, cross_attn_cls=SkipAttnProcessor)
     attn_modules = get_trainable_module(unet, "attention")
     loaded_from = None
@@ -227,7 +247,7 @@ def build_models(
         loaded_from = load_attention_checkpoint(attn_modules, resume_attn_ckpt, resume_attn_version)
     unet.to(device, dtype=weight_dtype)
     vae.requires_grad_(False)
-    return vae, unet, attn_modules, loaded_from, resolved_base_model_path
+    return vae, unet, attn_modules, loaded_from, resolved_base_model_path, resolved_vae_model_path
 
 
 class DressCodeDataset(Dataset):
@@ -248,7 +268,15 @@ class DressCodeDataset(Dataset):
 
     def _load_samples(self) -> List[Sample]:
         samples: List[Sample] = []
-        split_file = "train_pairs.txt" if self.split == "train" else "test_pairs_paired.txt"
+        split_to_file = {
+            "train": "train_pairs.txt",
+            "val": "test_pairs_paired.txt",
+            "paired": "test_pairs_paired.txt",
+            "unpaired": "test_pairs_unpaired.txt",
+        }
+        if self.split not in split_to_file:
+            raise ValueError(f"Unsupported dataset split: {self.split}")
+        split_file = split_to_file[self.split]
         for category in self.categories:
             category_dir = self.data_root / category
             pair_path = category_dir / split_file
@@ -382,6 +410,8 @@ def save_preview_grid(
                     tensor_to_pil(results[idx]),
                 ]
             )
+    if not all_images:
+        raise ValueError(f"No preview images were generated for {output_path}")
     make_grid(all_images, cols=4).save(output_path)
     unet.train()
 

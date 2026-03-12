@@ -1,5 +1,7 @@
 # CatVTON Practice
 
+See `RESULTS_AND_HANDOFF.md` for the final RTX full-run summary, artifact handoff, and MPS validation commands.
+
 DressCode dataset를 이용해 CatVTON 방식의 self-attention-only 학습을 재구성하는 프로젝트입니다.
 
 이 저장소는 두 단계를 기준으로 설계되어 있습니다.
@@ -38,7 +40,10 @@ DressCode 원본에는 `agnostic_masks`가 없으므로, 이 프로젝트는 `la
 ## 의존성
 
 ```bash
+python -m venv .venv --system-site-packages
+. .venv/Scripts/activate
 pip install -r requirements.txt
+pip install accelerate diffusers transformers safetensors
 ```
 
 ## 로컬 smoke 절차
@@ -57,34 +62,38 @@ python3 prepare_masks.py \
 ```bash
 python3 preview_infer.py \
   --data_root_path data/DressCode \
+  --vae_model_path stabilityai/sd-vae-ft-mse \
   --resume_attn_ckpt zhengchong/CatVTON \
   --resume_attn_version dresscode-16k-512 \
-  --device mps \
-  --mixed_precision no \
+  --device cuda \
+  --mixed_precision bf16 \
   --max_val_pairs_per_category 4 \
+  --split paired \
   --output_path outputs/smoke/validation/step-000000-preview.png
 ```
 
-### 3. 100-step smoke fine-tune
+### 3. 200-step smoke fine-tune
 
 ```bash
 python3 train.py \
   --data_root_path data/DressCode \
+  --vae_model_path stabilityai/sd-vae-ft-mse \
   --output_dir outputs/smoke \
-  --device mps \
-  --mixed_precision no \
+  --device cuda \
+  --mixed_precision bf16 \
+  --allow_tf32 \
   --resume_attn_ckpt zhengchong/CatVTON \
   --resume_attn_version dresscode-16k-512 \
   --train_batch_size 1 \
   --validation_batch_size 1 \
-  --gradient_accumulation_steps 1 \
-  --num_workers 0 \
-  --num_train_steps 100 \
+  --gradient_accumulation_steps 4 \
+  --num_workers 4 \
+  --num_train_steps 200 \
   --checkpointing_steps 50 \
   --validation_steps 50 \
-  --validation_num_inference_steps 10 \
+  --validation_num_inference_steps 20 \
   --run_validation_at_start \
-  --max_train_pairs_per_category 64 \
+  --max_train_pairs_per_category 128 \
   --max_val_pairs_per_category 4
 ```
 
@@ -93,6 +102,8 @@ python3 train.py \
 - `outputs/smoke/validation/step-000000.png`
 - `outputs/smoke/validation/step-000050.png`
 - `outputs/smoke/validation/step-000100.png`
+- `outputs/smoke/validation/step-000150.png`
+- `outputs/smoke/validation/step-000200.png`
 - `outputs/smoke/dresscode-16k-512/attention`
 
 ### 4. smoke checkpoint 재검증
@@ -100,12 +111,29 @@ python3 train.py \
 ```bash
 python3 preview_infer.py \
   --data_root_path data/DressCode \
+  --vae_model_path stabilityai/sd-vae-ft-mse \
   --resume_attn_ckpt outputs/smoke \
   --resume_attn_version dresscode-16k-512 \
-  --device mps \
-  --mixed_precision no \
+  --device cuda \
+  --mixed_precision bf16 \
   --max_val_pairs_per_category 4 \
+  --split paired \
   --output_path outputs/smoke/validation/post-train-preview.png
+```
+
+unpaired 확인:
+
+```bash
+python3 preview_infer.py \
+  --data_root_path data/DressCode \
+  --vae_model_path stabilityai/sd-vae-ft-mse \
+  --resume_attn_ckpt outputs/smoke \
+  --resume_attn_version dresscode-16k-512 \
+  --device cuda \
+  --mixed_precision bf16 \
+  --max_val_pairs_per_category 4 \
+  --split unpaired \
+  --output_path outputs/smoke/validation/post-train-unpaired-preview.png
 ```
 
 ## RTX 4080 Super full 학습 절차
@@ -127,9 +155,11 @@ python3 prepare_masks.py \
 ```bash
 python3 train.py \
   --data_root_path data/DressCode \
+  --vae_model_path stabilityai/sd-vae-ft-mse \
   --output_dir outputs/full \
   --device cuda \
   --mixed_precision bf16 \
+  --allow_tf32 \
   --resume_attn_ckpt zhengchong/CatVTON \
   --resume_attn_version dresscode-16k-512 \
   --train_batch_size 2 \
@@ -141,7 +171,7 @@ python3 train.py \
   --validation_steps 500
 ```
 
-먼저 20-step dry run, 이후 500-step 확인, 그 다음 full 16k로 확장하는 것을 권장합니다.
+먼저 500-step confidence run을 `outputs/full-500`로 확인하고, 이후 full 16k로 확장하는 것을 권장합니다.
 
 ## 체크포인트 형식
 

@@ -1,13 +1,15 @@
 import argparse
+import json
+import math
 import os
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from accelerate import Accelerator
+from accelerate import Accelerator, skip_first_batches
 from accelerate.utils import ProjectConfiguration, set_seed
 from diffusers import DDPMScheduler
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 from tqdm.auto import tqdm
 
 from catvton_runtime import (
@@ -26,10 +28,22 @@ from catvton_runtime import (
 from model.utils import get_trainable_module
 
 
+class FixedOrderSampler(Sampler[int]):
+    def __init__(self, indices):
+        self.indices = indices
+
+    def __iter__(self):
+        return iter(self.indices)
+
+    def __len__(self):
+        return len(self.indices)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Train CatVTON-style attention adapters on DressCode")
     parser.add_argument("--data_root_path", type=str, default="data/DressCode")
     parser.add_argument("--base_model_path", type=str, default="booksforcharlie/stable-diffusion-inpainting")
+    parser.add_argument("--vae_model_path", type=str, default="stabilityai/sd-vae-ft-mse")
     parser.add_argument("--output_dir", type=str, default="outputs")
     parser.add_argument("--project_name", type=str, default="catvton-practice")
     parser.add_argument("--dataset_tag", type=str, default="dresscode-16k-512")
@@ -60,8 +74,10 @@ def parse_args():
     parser.add_argument("--save_every_epoch", action="store_true")
     parser.add_argument("--resume_attn_ckpt", type=str, default=None)
     parser.add_argument("--resume_attn_version", type=str, default="dresscode-16k-512")
+    parser.add_argument("--resume_training_state", type=str, default=None)
     parser.add_argument("--max_train_pairs_per_category", type=int, default=None)
     parser.add_argument("--max_val_pairs_per_category", type=int, default=None)
+    parser.add_argument("--training_state_limit", type=int, default=2)
     parser.add_argument("--run_validation_at_start", action="store_true")
     return parser.parse_args()
 
@@ -88,8 +104,122 @@ def save_checkpoint(unet, output_dir: str, dataset_tag: str, accelerator: Accele
     return checkpoint_dir
 
 
+def build_train_loader(dataset, args, epoch: int):
+    generator = torch.Generator()
+    base_seed = args.seed if args.seed is not None else 0
+    generator.manual_seed(base_seed + epoch)
+    indices = torch.randperm(len(dataset), generator=generator).tolist()
+    sampler = FixedOrderSampler(indices)
+    return DataLoader(
+        dataset,
+        batch_size=args.train_batch_size,
+        sampler=sampler,
+        num_workers=args.num_workers,
+        drop_last=True,
+        persistent_workers=args.num_workers > 0,
+    )
+
+
 def take_validation_batches(loader):
     return [batch for batch in loader]
+
+
+def get_training_state_root(output_dir: str, dataset_tag: str) -> Path:
+    return Path(output_dir) / dataset_tag / "training_state"
+
+
+def get_training_state_dir(output_dir: str, dataset_tag: str, global_step: int) -> Path:
+    return get_training_state_root(output_dir, dataset_tag) / f"step-{global_step:06d}"
+
+
+def write_json(path: Path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+
+
+def read_json(path: Path):
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def cleanup_old_training_states(state_root: Path, keep_last: int):
+    if keep_last is None or keep_last <= 0 or not state_root.exists():
+        return
+    state_dirs = [path for path in state_root.iterdir() if path.is_dir() and path.name.startswith("step-")]
+    state_dirs.sort(key=lambda path: path.name)
+    while len(state_dirs) > keep_last:
+        stale_dir = state_dirs.pop(0)
+        for child in stale_dir.rglob("*"):
+            if child.is_file():
+                child.unlink()
+        for child in sorted(stale_dir.rglob("*"), reverse=True):
+            if child.is_dir():
+                child.rmdir()
+        stale_dir.rmdir()
+
+
+def save_training_state(args, accelerator: Accelerator, global_step: int, steps_per_epoch: int):
+    state_dir = get_training_state_dir(args.output_dir, args.dataset_tag, global_step)
+    state_root = get_training_state_root(args.output_dir, args.dataset_tag)
+    accelerator.save_state(str(state_dir), safe_serialization=False)
+    metadata = {
+        "global_step": global_step,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "train_batch_size": args.train_batch_size,
+        "steps_per_epoch": steps_per_epoch,
+        "dataset_tag": args.dataset_tag,
+    }
+    write_json(state_dir / "metadata.json", metadata)
+    write_json(state_root / "latest.json", {"latest_checkpoint": state_dir.name, **metadata})
+    cleanup_old_training_states(state_root, args.training_state_limit)
+    return state_dir
+
+
+def resolve_training_state_dir(args) -> Path:
+    requested = args.resume_training_state
+    state_root = get_training_state_root(args.output_dir, args.dataset_tag)
+    if requested == "latest":
+        if not state_root.exists():
+            raise FileNotFoundError(f"No saved training state found under {state_root}")
+        latest_path = state_root / "latest.json"
+        if latest_path.exists():
+            latest = read_json(latest_path)
+            return state_root / latest["latest_checkpoint"]
+        candidates = [path for path in state_root.iterdir() if path.is_dir() and path.name.startswith("step-")]
+        if not candidates:
+            raise FileNotFoundError(f"No saved training state found under {state_root}")
+        return sorted(candidates, key=lambda path: path.name)[-1]
+
+    path = Path(requested)
+    if path.is_dir() and (path / "metadata.json").exists():
+        return path
+    if path.is_dir() and (path / "latest.json").exists():
+        latest = read_json(path / "latest.json")
+        return path / latest["latest_checkpoint"]
+    raise FileNotFoundError(f"Could not resolve training state from {requested}")
+
+
+def load_training_state(args, accelerator: Accelerator, steps_per_epoch: int):
+    state_dir = resolve_training_state_dir(args)
+    metadata = read_json(state_dir / "metadata.json")
+    if metadata["gradient_accumulation_steps"] != args.gradient_accumulation_steps:
+        raise ValueError(
+            "gradient_accumulation_steps must match the saved training state "
+            f"({metadata['gradient_accumulation_steps']} != {args.gradient_accumulation_steps})"
+        )
+    if metadata["train_batch_size"] != args.train_batch_size:
+        raise ValueError(
+            "train_batch_size must match the saved training state "
+            f"({metadata['train_batch_size']} != {args.train_batch_size})"
+        )
+    if metadata["steps_per_epoch"] != steps_per_epoch:
+        raise ValueError(
+            "Current steps_per_epoch does not match the saved training state "
+            f"({metadata['steps_per_epoch']} != {steps_per_epoch})"
+        )
+    accelerator.load_state(str(state_dir))
+    return state_dir, metadata
 
 
 def main():
@@ -125,13 +255,6 @@ def main():
         max_pairs_per_category=args.max_val_pairs_per_category,
     )
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.train_batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        drop_last=True,
-    )
     validation_loader = DataLoader(
         validation_dataset,
         batch_size=args.validation_batch_size,
@@ -139,8 +262,9 @@ def main():
         num_workers=0,
     )
 
-    vae, unet, _, loaded_from, resolved_base_model_path = build_models(
+    vae, unet, _, loaded_from, resolved_base_model_path, resolved_vae_model_path = build_models(
         base_model_path=args.base_model_path,
+        vae_model_path=args.vae_model_path,
         device=device,
         weight_dtype=weight_dtype,
         resume_attn_ckpt=args.resume_attn_ckpt,
@@ -153,7 +277,7 @@ def main():
     for param in trainable_modules.parameters():
         param.requires_grad = True
 
-    noise_scheduler = DDPMScheduler.from_pretrained(args.base_model_path, subfolder="scheduler")
+    noise_scheduler = DDPMScheduler.from_pretrained(resolved_base_model_path, subfolder="scheduler")
     optimizer = torch.optim.AdamW(
         trainable_modules.parameters(),
         lr=args.learning_rate,
@@ -162,7 +286,10 @@ def main():
         weight_decay=args.weight_decay,
     )
 
-    unet, optimizer, train_loader = accelerator.prepare(unet, optimizer, train_loader)
+    unet, optimizer = accelerator.prepare(unet, optimizer)
+    steps_per_epoch = math.floor(len(train_dataset) / args.train_batch_size)
+    if steps_per_epoch == 0:
+        raise ValueError("Training dataset is smaller than train_batch_size; no train steps would be produced.")
 
     if accelerator.is_main_process and accelerator.log_with is not None:
         accelerator.init_trackers(
@@ -188,25 +315,54 @@ def main():
         if loaded_from is not None:
             print(f"loaded_attention_checkpoint={loaded_from}")
         print(f"resolved_base_model_path={resolved_base_model_path}")
+        print(f"resolved_vae_model_path={resolved_vae_model_path}")
 
-    if accelerator.is_main_process and args.run_validation_at_start and len(validation_dataset) > 0:
+    global_step = 0
+    resumed_state_dir = None
+    if args.resume_training_state:
+        resumed_state_dir, metadata = load_training_state(args, accelerator, steps_per_epoch)
+        global_step = int(metadata["global_step"])
+        if accelerator.is_main_process:
+            print(f"loaded_training_state={resumed_state_dir}")
+            print(f"resumed_global_step={global_step}")
+
+    if (
+        accelerator.is_main_process
+        and args.run_validation_at_start
+        and len(validation_dataset) > 0
+        and global_step == 0
+    ):
         save_preview_grid(
             unet=accelerator.unwrap_model(unet),
-                    vae=vae,
-                    device=device,
-                    weight_dtype=weight_dtype,
-                    base_model_path=resolved_base_model_path,
-                    batches=take_validation_batches(validation_loader),
-                    output_path=Path(args.output_dir) / "validation" / "step-000000.png",
-                    num_inference_steps=args.validation_num_inference_steps,
+            vae=vae,
+            device=device,
+            weight_dtype=weight_dtype,
+            base_model_path=resolved_base_model_path,
+            batches=take_validation_batches(validation_loader),
+            output_path=Path(args.output_dir) / "validation" / "step-000000.png",
+            num_inference_steps=args.validation_num_inference_steps,
             guidance_scale=args.validation_guidance_scale,
         )
 
-    global_step = 0
-    progress_bar = tqdm(total=args.num_train_steps, disable=not accelerator.is_local_main_process)
+    progress_bar = tqdm(
+        total=args.num_train_steps,
+        initial=global_step,
+        disable=not accelerator.is_local_main_process,
+    )
     last_loss = None
+    total_consumed_batches = global_step * args.gradient_accumulation_steps
+    start_epoch = total_consumed_batches // steps_per_epoch
+    skip_batches = total_consumed_batches % steps_per_epoch
+    current_epoch = start_epoch
 
     while global_step < args.num_train_steps:
+        train_loader = build_train_loader(train_dataset, args, current_epoch)
+        train_loader = accelerator.prepare_data_loader(train_loader)
+        if current_epoch == start_epoch and skip_batches > 0:
+            train_loader = skip_first_batches(train_loader, skip_batches)
+            if accelerator.is_main_process:
+                print(f"skipping_batches_for_resume={skip_batches} epoch={current_epoch}")
+
         for batch in train_loader:
             with accelerator.accumulate(unet):
                 person = batch["person"].to(device, dtype=weight_dtype)
@@ -268,7 +424,9 @@ def main():
 
             if accelerator.is_main_process and global_step % args.checkpointing_steps == 0:
                 checkpoint_dir = save_checkpoint(unet, args.output_dir, args.dataset_tag, accelerator)
+                state_dir = save_training_state(args, accelerator, global_step, steps_per_epoch)
                 print(f"saved_checkpoint={checkpoint_dir} step={global_step}")
+                print(f"saved_training_state={state_dir}")
 
             if accelerator.is_main_process and len(validation_dataset) > 0 and global_step % args.validation_steps == 0:
                 save_preview_grid(
@@ -288,11 +446,17 @@ def main():
 
         if args.save_every_epoch and accelerator.is_main_process:
             save_checkpoint(unet, args.output_dir, args.dataset_tag, accelerator)
+            save_training_state(args, accelerator, global_step, steps_per_epoch)
+
+        current_epoch += 1
+        skip_batches = 0
 
     final_checkpoint = None
     if accelerator.is_main_process:
         final_checkpoint = save_checkpoint(unet, args.output_dir, args.dataset_tag, accelerator)
+        final_state_dir = save_training_state(args, accelerator, global_step, steps_per_epoch)
         print(f"final_checkpoint={final_checkpoint}")
+        print(f"final_training_state={final_state_dir}")
         print(f"final_loss={last_loss}")
 
     accelerator.end_training()

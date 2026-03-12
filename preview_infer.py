@@ -15,13 +15,15 @@ from catvton_runtime import (
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Generate fixed paired validation previews from an attention checkpoint.")
+    parser = argparse.ArgumentParser(description="Generate fixed DressCode previews from an attention checkpoint.")
     parser.add_argument("--data_root_path", type=str, default="data/DressCode")
     parser.add_argument("--base_model_path", type=str, default="booksforcharlie/stable-diffusion-inpainting")
+    parser.add_argument("--vae_model_path", type=str, default="stabilityai/sd-vae-ft-mse")
     parser.add_argument("--resume_attn_ckpt", type=str, required=True)
     parser.add_argument("--resume_attn_version", type=str, default="dresscode-16k-512")
     parser.add_argument("--output_path", type=str, required=True)
     parser.add_argument("--categories", type=str, default="upper_body,lower_body,dresses")
+    parser.add_argument("--split", type=str, default="paired", choices=["paired", "unpaired"])
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "mps", "cpu"])
     parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"])
     parser.add_argument("--width", type=int, default=384)
@@ -43,15 +45,16 @@ def main():
         data_root_path=args.data_root_path,
         categories=categories,
         size=(args.width, args.height),
-        split="val",
+        split=args.split,
         max_pairs_per_category=args.max_val_pairs_per_category,
     )
     print(f"device={device} weight_dtype={weight_dtype}")
-    print(f"val_summary={dataset_summary(dataset)} total={len(dataset)}")
+    print(f"{args.split}_summary={dataset_summary(dataset)} total={len(dataset)}")
 
     loader = DataLoader(dataset, batch_size=args.validation_batch_size, shuffle=False, num_workers=0)
-    vae, unet, _, loaded_from, resolved_base_model_path = build_models(
+    vae, unet, _, loaded_from, resolved_base_model_path, resolved_vae_model_path = build_models(
         base_model_path=args.base_model_path,
+        vae_model_path=args.vae_model_path,
         device=device,
         weight_dtype=weight_dtype,
         resume_attn_ckpt=args.resume_attn_ckpt,
@@ -59,6 +62,7 @@ def main():
     )
     print(f"loaded_attention_checkpoint={loaded_from}")
     print(f"resolved_base_model_path={resolved_base_model_path}")
+    print(f"resolved_vae_model_path={resolved_vae_model_path}")
 
     save_preview_grid(
         unet=unet,
